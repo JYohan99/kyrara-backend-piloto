@@ -289,6 +289,49 @@ export async function appointmentRoutes(app: FastifyInstance) {
   });
 
   // --------------------------------------------------------------------------
+  // PATCH /appointments/:id/complete -> Marcar una cita como completada
+  // --------------------------------------------------------------------------
+  app.patch("/:id/complete", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const existingRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
+    if (!existingRes.rows[0]) return reply.status(404).send({ error: "Reserva no encontrada" });
+
+    await pool.query("UPDATE appointment SET status = 'COMPLETED' WHERE id = $1", [id]);
+    const updatedRes = await pool.query(
+      `SELECT a.*, c.name as customer_name, c.phone as customer_phone, s.name as service_name
+       FROM appointment a
+       JOIN customer c ON c.id = a.customer_id
+       JOIN service s ON s.id = a.service_id
+       WHERE a.id = $1`,
+      [id]
+    );
+    return updatedRes.rows[0];
+  });
+
+  // --------------------------------------------------------------------------
+  // PATCH /appointments/:id -> Actualizar estado genérico de la cita
+  // --------------------------------------------------------------------------
+  app.patch("/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const body = request.body as { status?: string };
+    const existingRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
+    if (!existingRes.rows[0]) return reply.status(404).send({ error: "Reserva no encontrada" });
+
+    if (body?.status) {
+      await pool.query("UPDATE appointment SET status = $1 WHERE id = $2", [body.status, id]);
+    }
+    const updatedRes = await pool.query(
+      `SELECT a.*, c.name as customer_name, c.phone as customer_phone, s.name as service_name
+       FROM appointment a
+       JOIN customer c ON c.id = a.customer_id
+       JOIN service s ON s.id = a.service_id
+       WHERE a.id = $1`,
+      [id]
+    );
+    return updatedRes.rows[0];
+  });
+
+  // --------------------------------------------------------------------------
   // POST /appointments/:id/respond -> Aceptar o rechazar cita en modo aprobación
   // --------------------------------------------------------------------------
   app.post("/:id/respond", async (request, reply) => {
