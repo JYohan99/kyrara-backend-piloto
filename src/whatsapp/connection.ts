@@ -3,19 +3,26 @@ import makeWASocket, {
   initAuthCreds,
   BufferJSON,
   proto,
+  Browsers,
   type AuthenticationState,
+  type WASocket,
 } from "baileys";
 import { Boom } from "@hapi/boom";
-import qrcode from "qrcode-terminal";
+import qrcodeTerminal from "qrcode-terminal";
 import pino from "pino";
 import { pool } from "../database/connection.js";
 import { handleIncomingMessage } from "./engine.js";
 
 const logger = pino({ level: "silent" });
 
-// Guarda la sesión de WhatsApp (equivalente a "dispositivos vinculados")
-// directo en Postgres, en vez de en archivos locales — así sobrevive a
-// cualquier redeploy en Render, igual que el resto de los datos.
+let currentSock: WASocket | null = null;
+let latestQR: string | null = null;
+let connectionStatus: "open" | "connecting" | "close" = "connecting";
+let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+
+// ============================================================================
+// PERSISTENCIA DE CREDENCIALES EN POSTGRES
+// ============================================================================
 async function usePostgresAuthState(): Promise<{
   state: AuthenticationState;
   saveCreds: () => Promise<void>;
@@ -38,7 +45,16 @@ async function usePostgresAuthState(): Promise<{
   }
 
   const storedCreds = await readData("creds");
-  const creds = storedCreds ?? initAuthCreds();
+  let creds = storedCreds;
+
+  // Si no está registrado y tenía un intento previo fallido, limpiar credenciales intermedias
+  if (creds && !creds.registered && creds.me) {
+    delete creds.me;
+    delete creds.pairingCode;
+  }
+  if (!creds) {
+    creds = initAuthCreds();
+  }
 
   return {
     state: {
@@ -76,9 +92,9 @@ async function usePostgresAuthState(): Promise<{
   };
 }
 
-let currentSock: any = null;
-let latestQR: string | null = null;
-let connectionStatus: "open" | "connecting" | "close" = "connecting";
+// ============================================================================
+// FUNCIONES PÚBLICAS DE ESTADO Y VINCULACIÓN
+// ============================================================================
 
 export function getWhatsAppStatus() {
   return {
@@ -90,21 +106,55 @@ export function getWhatsAppStatus() {
 }
 
 export async function requestPairingCode(phoneNumber: string): Promise<string> {
-  if (!currentSock) {
-    throw new Error("El servicio de WhatsApp está iniciándose, intenta de nuevo en unos segundos.");
+  let cleanNumber = phoneNumber.replace(/[^0-9]/g, "");
+
+  // Auto-formateo inteligente para números de Uruguay:
+  // Si empieza con 09 (ej. 093927667, 9 dígitos): convertir a 59893927667
+  if (cleanNumber.startsWith("09") && cleanNumber.length === 9) {
+    cleanNumber = "598" + cleanNumber.slice(1);
+  } else if (cleanNumber.startsWith("9") && cleanNumber.length === 8) {
+    // Si escribió 93927667 (8 dígitos sin el 0 ni el 598): convertir a 59893927667
+    cleanNumber = "598" + cleanNumber;
   }
+
+  if (cleanNumber.length < 10) {
+    throw new Error(
+      `Número inválido (${cleanNumber}). Asegúrate de ingresar el número completo con código de país (ej. 59893927667).`
+    );
+  }
+
+  // Si el socket está cerrado o no existe, reiniciar
+  if (!currentSock || connectionStatus === "close") {
+    console.log("Socket desconectado, reiniciando antes de pedir pairing code...");
+    await startWhatsApp();
+  }
+
+  // Esperar hasta que el socket esté conectado y emitiendo handshake
+  let attempts = 0;
+  while (!latestQR && connectionStatus !== "open" && attempts < 30) {
+    await new Promise((r) => setTimeout(r, 500));
+    attempts++;
+  }
+
+  if (!currentSock || connectionStatus === "close") {
+    throw new Error("El socket de WhatsApp no pudo conectar. Presiona de nuevo el botón.");
+  }
+
   if (currentSock.authState?.creds?.registered) {
-    throw new Error("WhatsApp ya está vinculado y conectado.");
+    throw new Error("WhatsApp ya se encuentra vinculado y conectado.");
   }
-  const cleanNumber = phoneNumber.replace(/[^0-9]/g, "");
-  if (!cleanNumber || cleanNumber.length < 8) {
-    throw new Error("El número debe tener al menos 8 dígitos e incluir el código de país (ej. 59899123456).");
-  }
+
+  console.log(`Solicitando código de vinculación para ${cleanNumber}...`);
   const code = await currentSock.requestPairingCode(cleanNumber);
+  console.log(`✅ Código de vinculación obtenido: ${code}`);
   return code;
 }
 
 export async function restartWhatsApp() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
   if (currentSock) {
     try {
       currentSock.end(undefined);
@@ -116,6 +166,10 @@ export async function restartWhatsApp() {
 }
 
 export async function logoutWhatsApp() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
   if (currentSock) {
     try {
       await currentSock.logout();
@@ -127,12 +181,25 @@ export async function logoutWhatsApp() {
   return startWhatsApp();
 }
 
+// ============================================================================
+// ARRANQUE PRINCIPAL DEL SOCKET DE WHATSAPP
+// ============================================================================
+
 export async function startWhatsApp() {
+  if (reconnectTimeout) {
+    clearTimeout(reconnectTimeout);
+    reconnectTimeout = null;
+  }
+
   const { state, saveCreds } = await usePostgresAuthState();
 
   const sock = makeWASocket({
     auth: state,
     logger,
+    browser: Browsers.ubuntu("Chrome"),
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 25000,
   });
 
   currentSock = sock;
@@ -146,21 +213,30 @@ export async function startWhatsApp() {
     if (qr) {
       latestQR = qr;
       console.log("\nEscaneá este código QR con WhatsApp (Dispositivos vinculados) en el teléfono del negocio:\n");
-      qrcode.generate(qr, { small: true });
+      qrcodeTerminal.generate(qr, { small: true });
     }
 
     if (connection === "close") {
       connectionStatus = "close";
-      const shouldReconnect =
-        (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+
       console.log(
-        "Conexión de WhatsApp cerrada.",
-        shouldReconnect ? "Reintentando..." : "Sesión cerrada, hay que volver a escanear el QR o generar código."
+        `Conexión de WhatsApp cerrada (status: ${statusCode}).`,
+        isLoggedOut ? "Sesión desvinculada." : "Reintentando reconexión en 3 segundos..."
       );
-      if (shouldReconnect) {
-        startWhatsApp();
-      } else {
-        latestQR = null;
+
+      latestQR = null;
+
+      if (isLoggedOut) {
+        pool.query("DELETE FROM whatsapp_auth").catch(() => {});
+      }
+
+      if (!reconnectTimeout) {
+        reconnectTimeout = setTimeout(() => {
+          reconnectTimeout = null;
+          startWhatsApp();
+        }, 3000);
       }
     } else if (connection === "open") {
       connectionStatus = "open";
