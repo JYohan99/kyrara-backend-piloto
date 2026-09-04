@@ -76,6 +76,57 @@ async function usePostgresAuthState(): Promise<{
   };
 }
 
+let currentSock: any = null;
+let latestQR: string | null = null;
+let connectionStatus: "open" | "connecting" | "close" = "connecting";
+
+export function getWhatsAppStatus() {
+  return {
+    status: connectionStatus,
+    isRegistered: currentSock?.authState?.creds?.registered ?? false,
+    hasQR: Boolean(latestQR),
+    qr: latestQR,
+  };
+}
+
+export async function requestPairingCode(phoneNumber: string): Promise<string> {
+  if (!currentSock) {
+    throw new Error("El servicio de WhatsApp está iniciándose, intenta de nuevo en unos segundos.");
+  }
+  if (currentSock.authState?.creds?.registered) {
+    throw new Error("WhatsApp ya está vinculado y conectado.");
+  }
+  const cleanNumber = phoneNumber.replace(/[^0-9]/g, "");
+  if (!cleanNumber || cleanNumber.length < 8) {
+    throw new Error("El número debe tener al menos 8 dígitos e incluir el código de país (ej. 59899123456).");
+  }
+  const code = await currentSock.requestPairingCode(cleanNumber);
+  return code;
+}
+
+export async function restartWhatsApp() {
+  if (currentSock) {
+    try {
+      currentSock.end(undefined);
+    } catch {}
+  }
+  latestQR = null;
+  connectionStatus = "connecting";
+  return startWhatsApp();
+}
+
+export async function logoutWhatsApp() {
+  if (currentSock) {
+    try {
+      await currentSock.logout();
+    } catch {}
+  }
+  await pool.query("DELETE FROM whatsapp_auth");
+  latestQR = null;
+  connectionStatus = "close";
+  return startWhatsApp();
+}
+
 export async function startWhatsApp() {
   const { state, saveCreds } = await usePostgresAuthState();
 
@@ -84,25 +135,36 @@ export async function startWhatsApp() {
     logger,
   });
 
+  currentSock = sock;
+  connectionStatus = "connecting";
+
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      latestQR = qr;
       console.log("\nEscaneá este código QR con WhatsApp (Dispositivos vinculados) en el teléfono del negocio:\n");
       qrcode.generate(qr, { small: true });
     }
 
     if (connection === "close") {
+      connectionStatus = "close";
       const shouldReconnect =
         (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log(
         "Conexión de WhatsApp cerrada.",
-        shouldReconnect ? "Reintentando..." : "Sesión cerrada, hay que volver a escanear el QR."
+        shouldReconnect ? "Reintentando..." : "Sesión cerrada, hay que volver a escanear el QR o generar código."
       );
-      if (shouldReconnect) startWhatsApp();
+      if (shouldReconnect) {
+        startWhatsApp();
+      } else {
+        latestQR = null;
+      }
     } else if (connection === "open") {
+      connectionStatus = "open";
+      latestQR = null;
       console.log("✅ WhatsApp conectado correctamente.");
     }
   });
