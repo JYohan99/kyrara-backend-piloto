@@ -2,9 +2,15 @@ import { sendPushNotification } from "../notifications/firebase.js";
 import type { WASocket } from "baileys";
 import { randomUUID } from "node:crypto";
 import { pool } from "../database/connection.js";
+import {
+  dayOfWeek,
+  getCurrentDateAndMinutes,
+  minutesToTime,
+  timeToMinutes,
+} from "../core/time.js";
 
 // ============================================================================
-// SECCIÓN 1: UTILIDADES AUXILIARES (WHATSAPP, TIEMPO, FECHAS Y TEXTO)
+// SECCIÓN 1: UTILIDADES AUXILIARES (WHATSAPP Y TEXTO)
 // ============================================================================
 
 /**
@@ -12,67 +18,6 @@ import { pool } from "../database/connection.js";
  */
 function extractLid(jid: string): string {
   return jid.split("@")[0];
-}
-
-/**
- * Convierte un string "HH:mm" a minutos totales desde las 00:00.
- */
-function timeToMinutes(t: string): number {
-  const [h, m] = t.split(":").map(Number);
-  return h * 60 + m;
-}
-
-/**
- * Convierte minutos totales a string con formato "HH:mm".
- */
-function minutesToTime(mins: number): string {
-  const h = Math.floor(mins / 60).toString().padStart(2, "0");
-  const m = (mins % 60).toString().padStart(2, "0");
-  return `${h}:${m}`;
-}
-
-/**
- * Obtiene el índice del día de la semana (0 = Domingo ... 6 = Sábado).
- */
-function dayOfWeek(dateStr: string): number {
-  const [y, m, d] = dateStr.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
-}
-
-/**
- * Obtiene la fecha actual ("YYYY-MM-DD") y la hora actual en minutos para la zona horaria del negocio.
- */
-function getCurrentDateAndMinutes(timezone: string = "America/Montevideo"): {
-  currentDate: string;
-  currentMinutes: number;
-} {
-  try {
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat("en-CA", {
-      timeZone: timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-    const parts = formatter.formatToParts(now);
-    const year = parts.find((p) => p.type === "year")?.value;
-    const month = parts.find((p) => p.type === "month")?.value;
-    const day = parts.find((p) => p.type === "day")?.value;
-    const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
-    const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
-    return {
-      currentDate: `${year}-${month}-${day}`,
-      currentMinutes: hour * 60 + minute,
-    };
-  } catch {
-    const now = new Date();
-    const currentDate = now.toISOString().slice(0, 10);
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-    return { currentDate, currentMinutes };
-  }
 }
 
 const DIAS = ["Domingo", "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado"];

@@ -1,277 +1,69 @@
-import { sendPushNotification } from "../notifications/firebase.js";
 import type { FastifyInstance } from "fastify";
-import { randomUUID } from "node:crypto";
-import { pool } from "../database/connection.js";
-
-// ============================================================================
-// FUNCIONES AUXILIARES DE TIEMPO Y FECHAS
-// ============================================================================
-
-/**
- * Convierte "HH:mm" a minutos totales transcurridos desde las 00:00.
- */
-function timeToMinutes(t: string): number {
-  const [h, m] = t.split(":").map(Number);
-  return h * 60 + m;
-}
-
-/**
- * Convierte una cantidad de minutos a formato legible "HH:mm".
- */
-function minutesToTime(mins: number): string {
-  const h = Math.floor(mins / 60).toString().padStart(2, "0");
-  const m = (mins % 60).toString().padStart(2, "0");
-  return `${h}:${m}`;
-}
-
-/**
- * Obtiene el día de la semana (0 = Domingo, 1 = Lunes, ..., 6 = Sábado).
- */
-function dayOfWeek(dateStr: string): number {
-  const [y, m, d] = dateStr.split("-").map(Number);
-  return new Date(Date.UTC(y, m - 1, d)).getUTCDay();
-}
-
-/**
- * Devuelve la fecha actual y los minutos de hoy en la zona horaria indicada.
- */
-function getCurrentDateAndMinutes(timezone: string = "America/Montevideo"): {
-  currentDate: string;
-  currentMinutes: number;
-} {
-  try {
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat("en-CA", {
-      timeZone: timezone,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-    const parts = formatter.formatToParts(now);
-    const year = parts.find((p) => p.type === "year")?.value;
-    const month = parts.find((p) => p.type === "month")?.value;
-    const day = parts.find((p) => p.type === "day")?.value;
-    const hour = Number(parts.find((p) => p.type === "hour")?.value ?? "0");
-    const minute = Number(parts.find((p) => p.type === "minute")?.value ?? "0");
-    return {
-      currentDate: `${year}-${month}-${day}`,
-      currentMinutes: hour * 60 + minute,
-    };
-  } catch {
-    const now = new Date();
-    const currentDate = now.toISOString().slice(0, 10);
-    const currentMinutes = now.getHours() * 60 + now.getMinutes();
-    return { currentDate, currentMinutes };
-  }
-}
+import {
+  getBusinessProfile,
+  setBusinessPushToken,
+  updateBusinessProfile,
+  updateBusinessSettings,
+} from "../core/business.js";
+import { sendPushNotification } from "../notifications/firebase.js";
+import { listServices } from "../services/service.js";
+import { CreateAppointmentInput } from "./models.js";
+import {
+  bookAppointment,
+  calculateAvailableSlots,
+  cancelAppointment,
+  completeAppointment,
+  listAppointmentsForDay,
+  respondAppointmentApproval,
+  updateAppointment,
+} from "./service.js";
 
 // ============================================================================
 // DEFINICIÓN DE RUTAS DE CITAS Y CONFIGURACIÓN DEL NEGOCIO
 // ============================================================================
 
 export async function appointmentRoutes(app: FastifyInstance) {
-  /**
-   * Obtiene el ID del negocio registrado en la base de datos.
-   */
-  async function getBusinessId(): Promise<string | null> {
-    const { rows } = await pool.query("SELECT id FROM business LIMIT 1");
-    return rows[0]?.id ?? null;
-  }
-
   // --------------------------------------------------------------------------
   // GET /appointments -> Listar agenda del día
   // --------------------------------------------------------------------------
   app.get("/", async (request) => {
     const { date } = request.query as { date?: string };
-    const day = date ?? new Date().toISOString().slice(0, 10);
-    const { rows } = await pool.query(
-      `SELECT a.*, c.name as customer_name, c.phone as customer_phone, s.name as service_name
-       FROM appointment a
-       JOIN customer c ON c.id = a.customer_id
-       JOIN service s ON s.id = a.service_id
-       WHERE a.date = $1 AND a.status != 'CANCELLED'
-       ORDER BY a.start_time`,
-      [day]
-    );
-    return rows;
+    return listAppointmentsForDay(date);
   });
 
   // --------------------------------------------------------------------------
   // GET /appointments/available-slots -> Obtener horarios libres disponibles
   // --------------------------------------------------------------------------
   app.get("/available-slots", async (request, reply) => {
-    const { date, service_id } = request.query as { date?: string; service_id?: string };
+    const { date, service_id } = request.query as {
+      date?: string;
+      service_id?: string;
+    };
     if (!date || !service_id) {
       return reply.status(400).send({ error: "date y service_id son obligatorios" });
     }
-
-    const businessId = await getBusinessId();
-    if (!businessId) return reply.status(400).send({ error: "No hay negocio cargado" });
-
-    const businessRes = await pool.query("SELECT slot_step_minutes, timezone FROM business WHERE id = $1", [businessId]);
-    const STEP = businessRes.rows[0]?.slot_step_minutes ?? 30;
-    const timezone = businessRes.rows[0]?.timezone ?? "America/Montevideo";
-
-    const { currentDate, currentMinutes } = getCurrentDateAndMinutes(timezone);
-
-    // Descartar fechas anteriores a hoy
-    if (date < currentDate) {
-      return { date, service_id, slots: [] };
+    try {
+      return await calculateAvailableSlots(date, service_id);
+    } catch (err: any) {
+      const status = err.message.includes("no encontrado") ? 404 : 400;
+      return reply.status(status).send({ error: err.message });
     }
-
-    const serviceRes = await pool.query("SELECT * FROM service WHERE id = $1 AND active = 1", [service_id]);
-    const service = serviceRes.rows[0];
-    if (!service) return reply.status(404).send({ error: "Servicio no encontrado o inactivo" });
-
-    // Excepciones de disponibilidad (vacaciones, feriados, etc.)
-    const exceptionsRes = await pool.query(
-      "SELECT * FROM availability_exception WHERE business_id = $1 AND date = $2",
-      [businessId, date]
-    );
-    const exceptions = exceptionsRes.rows as {
-      closed_all_day: number;
-      start_time: string | null;
-      end_time: string | null;
-    }[];
-
-    if (exceptions.some((e) => e.closed_all_day)) {
-      return { date, service_id, slots: [] };
-    }
-
-    // Horarios de apertura semanales
-    const dow = dayOfWeek(date);
-    const windowsRes = await pool.query(
-      "SELECT * FROM availability WHERE business_id = $1 AND day_of_week = $2 AND active = 1",
-      [businessId, dow]
-    );
-    const windows = windowsRes.rows as { start_time: string; end_time: string }[];
-    if (windows.length === 0) return { date, service_id, slots: [] };
-
-    // Turnos ocupados ya reservados
-    const busyRes = await pool.query(
-      `SELECT start_time, end_time FROM appointment
-       WHERE business_id = $1 AND date = $2 AND status != 'CANCELLED'`,
-      [businessId, date]
-    );
-    const busy = busyRes.rows as { start_time: string; end_time: string }[];
-
-    const blocked = [
-      ...busy.map((b) => ({ start: timeToMinutes(b.start_time), end: timeToMinutes(b.end_time) })),
-      ...exceptions
-        .filter((e) => !e.closed_all_day && e.start_time && e.end_time)
-        .map((e) => ({ start: timeToMinutes(e.start_time!), end: timeToMinutes(e.end_time!) })),
-    ];
-
-    const duration = service.duration_minutes;
-    const slots: string[] = [];
-    const isToday = date === currentDate;
-
-    for (const w of windows) {
-      const windowStart = timeToMinutes(w.start_time);
-      const windowEnd = timeToMinutes(w.end_time);
-
-      for (let start = windowStart; start + duration <= windowEnd; start += STEP) {
-        // Filtrar horarios que ya pasaron hoy
-        if (isToday && start <= currentMinutes) {
-          continue;
-        }
-
-        const end = start + duration;
-        const overlaps = blocked.some((b) => start < b.end && end > b.start);
-        if (!overlaps) slots.push(minutesToTime(start));
-      }
-    }
-
-    return { date, service_id, duration_minutes: duration, slots };
   });
 
   // --------------------------------------------------------------------------
   // POST /appointments -> Crear reserva manual (desde la app)
   // --------------------------------------------------------------------------
   app.post("/", async (request, reply) => {
-    const body = request.body as {
-      customer_id?: string;
-      service_id?: string;
-      date?: string;
-      start_time?: string;
-      created_via?: "whatsapp" | "manual";
-    };
-
-    if (!body.customer_id || !body.service_id || !body.date || !body.start_time) {
-      return reply.status(400).send({ error: "customer_id, service_id, date y start_time son obligatorios" });
-    }
-
-    const businessId = await getBusinessId();
-    if (!businessId) return reply.status(400).send({ error: "No hay negocio cargado" });
-
-    const businessRes = await pool.query("SELECT timezone FROM business WHERE id = $1", [businessId]);
-    const timezone = businessRes.rows[0]?.timezone ?? "America/Montevideo";
-    const { currentDate, currentMinutes } = getCurrentDateAndMinutes(timezone);
-
-    if (body.date < currentDate || (body.date === currentDate && timeToMinutes(body.start_time) <= currentMinutes)) {
-      return reply.status(400).send({ error: "No es posible agendar un turno en un horario o fecha que ya pasó." });
-    }
-
-    const serviceRes = await pool.query("SELECT duration_minutes FROM service WHERE id = $1", [body.service_id]);
-    const service = serviceRes.rows[0];
-    if (!service) return reply.status(404).send({ error: "Servicio no encontrado" });
-
-    const customerRes = await pool.query("SELECT id FROM customer WHERE id = $1", [body.customer_id]);
-    if (!customerRes.rows[0]) return reply.status(404).send({ error: "Cliente no encontrado" });
-
-    const startMin = timeToMinutes(body.start_time);
-    const endMin = startMin + service.duration_minutes;
-    const endTime = minutesToTime(endMin);
-
-    // Transacción segura para evitar solapamientos concurrentes
-    const client = await pool.connect();
+    const body = request.body as CreateAppointmentInput;
     try {
-      await client.query("BEGIN");
-
-      const conflictRes = await client.query(
-        `SELECT id FROM appointment
-         WHERE business_id = $1 AND date = $2 AND status != 'CANCELLED'
-         AND start_time < $3 AND end_time > $4`,
-        [businessId, body.date, endTime, body.start_time]
-      );
-
-      if (conflictRes.rows[0]) {
-        await client.query("ROLLBACK");
-        return reply.status(409).send({ error: "El horario ya no está disponible" });
+      const created = await bookAppointment(body);
+      return reply.status(201).send(created);
+    } catch (err: any) {
+      if (err.message.includes("ya no está disponible")) {
+        return reply.status(409).send({ error: err.message });
       }
-
-      const id = randomUUID();
-      await client.query(
-        `INSERT INTO appointment (id, business_id, customer_id, service_id, date, start_time, end_time, status, created_via)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'CONFIRMED', $8)`,
-        [
-          id,
-          businessId,
-          body.customer_id,
-          body.service_id,
-          body.date,
-          body.start_time,
-          endTime,
-          body.created_via ?? "manual",
-        ]
-      );
-
-      // Reactivar automáticamente al cliente si estaba marcado como inactivo/eliminado
-      await client.query(
-        "UPDATE customer SET active = 1 WHERE id = $1 AND active = 0",
-        [body.customer_id]
-      );
-
-      await client.query("COMMIT");
-      return { id, date: body.date, start_time: body.start_time, end_time: endTime, status: "CONFIRMED" };
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
+      const status = err.message.includes("no encontrado") ? 404 : 400;
+      return reply.status(status).send({ error: err.message });
     }
   });
 
@@ -280,12 +72,11 @@ export async function appointmentRoutes(app: FastifyInstance) {
   // --------------------------------------------------------------------------
   app.patch("/:id/cancel", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const existingRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
-    if (!existingRes.rows[0]) return reply.status(404).send({ error: "Reserva no encontrada" });
-
-    await pool.query("UPDATE appointment SET status = 'CANCELLED' WHERE id = $1", [id]);
-    const updatedRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
-    return updatedRes.rows[0];
+    try {
+      return await cancelAppointment(id);
+    } catch (err: any) {
+      return reply.status(404).send({ error: err.message });
+    }
   });
 
   // --------------------------------------------------------------------------
@@ -293,19 +84,11 @@ export async function appointmentRoutes(app: FastifyInstance) {
   // --------------------------------------------------------------------------
   app.patch("/:id/complete", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const existingRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
-    if (!existingRes.rows[0]) return reply.status(404).send({ error: "Reserva no encontrada" });
-
-    await pool.query("UPDATE appointment SET status = 'COMPLETED' WHERE id = $1", [id]);
-    const updatedRes = await pool.query(
-      `SELECT a.*, c.name as customer_name, c.phone as customer_phone, s.name as service_name
-       FROM appointment a
-       JOIN customer c ON c.id = a.customer_id
-       JOIN service s ON s.id = a.service_id
-       WHERE a.id = $1`,
-      [id]
-    );
-    return updatedRes.rows[0];
+    try {
+      return await completeAppointment(id);
+    } catch (err: any) {
+      return reply.status(404).send({ error: err.message });
+    }
   });
 
   // --------------------------------------------------------------------------
@@ -314,21 +97,11 @@ export async function appointmentRoutes(app: FastifyInstance) {
   app.patch("/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
     const body = request.body as { status?: string };
-    const existingRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
-    if (!existingRes.rows[0]) return reply.status(404).send({ error: "Reserva no encontrada" });
-
-    if (body?.status) {
-      await pool.query("UPDATE appointment SET status = $1 WHERE id = $2", [body.status, id]);
+    try {
+      return await updateAppointment(id, body?.status);
+    } catch (err: any) {
+      return reply.status(404).send({ error: err.message });
     }
-    const updatedRes = await pool.query(
-      `SELECT a.*, c.name as customer_name, c.phone as customer_phone, s.name as service_name
-       FROM appointment a
-       JOIN customer c ON c.id = a.customer_id
-       JOIN service s ON s.id = a.service_id
-       WHERE a.id = $1`,
-      [id]
-    );
-    return updatedRes.rows[0];
   });
 
   // --------------------------------------------------------------------------
@@ -337,14 +110,11 @@ export async function appointmentRoutes(app: FastifyInstance) {
   app.post("/:id/respond", async (request, reply) => {
     const { id } = request.params as { id: string };
     const { decision } = request.body as { decision: "accept" | "reject" };
-
-    const existingRes = await pool.query("SELECT * FROM appointment WHERE id = $1", [id]);
-    if (!existingRes.rows[0]) return reply.status(404).send({ error: "Reserva no encontrada" });
-
-    const newStatus = decision === "accept" ? "CONFIRMED" : "CANCELLED";
-    await pool.query("UPDATE appointment SET status = $1 WHERE id = $2", [newStatus, id]);
-
-    return { id, status: newStatus };
+    try {
+      return await respondAppointmentApproval(id, decision);
+    } catch (err: any) {
+      return reply.status(404).send({ error: err.message });
+    }
   });
 
   // --------------------------------------------------------------------------
@@ -357,71 +127,38 @@ export async function appointmentRoutes(app: FastifyInstance) {
       address?: string;
       logo_base64?: string;
     };
-    const businessId = await getBusinessId();
-    if (!businessId) return reply.status(400).send({ error: "No hay negocio cargado" });
-
-    const existingRes = await pool.query("SELECT * FROM business WHERE id = $1", [businessId]);
-    const existing = existingRes.rows[0];
-
-    await pool.query(
-      "UPDATE business SET name = $1, phone = $2, address = $3, logo_base64 = $4 WHERE id = $5",
-      [
-        body.name ?? existing.name,
-        body.phone ?? existing.phone,
-        body.address ?? existing.address,
-        body.logo_base64 !== undefined ? body.logo_base64 : existing.logo_base64,
-        businessId,
-      ]
-    );
-
-    const updatedRes = await pool.query("SELECT * FROM business WHERE id = $1", [businessId]);
-    return updatedRes.rows[0];
+    try {
+      return await updateBusinessProfile(body);
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
   });
 
   // --------------------------------------------------------------------------
   // PATCH /appointments/business/settings -> Ajustes de turnos, modo y notificaciones
   // --------------------------------------------------------------------------
   app.patch("/business/settings", async (request, reply) => {
-    const { slot_step_minutes, booking_mode, notify_upcoming_appointments } = request.body as {
+    const body = request.body as {
       slot_step_minutes?: number;
       booking_mode?: "auto" | "approval";
       notify_upcoming_appointments?: boolean | number;
     };
-    const businessId = await getBusinessId();
-    if (!businessId) return reply.status(400).send({ error: "No hay negocio cargado" });
-
-    if (slot_step_minutes && ![15, 30, 45, 60].includes(slot_step_minutes)) {
-      return reply.status(400).send({ error: "slot_step_minutes debe ser 15, 30, 45 o 60" });
+    try {
+      return await updateBusinessSettings(body);
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
     }
-
-    if (slot_step_minutes) {
-      await pool.query("UPDATE business SET slot_step_minutes = $1 WHERE id = $2", [slot_step_minutes, businessId]);
-    }
-
-    if (booking_mode && ["auto", "approval"].includes(booking_mode)) {
-      await pool.query("UPDATE business SET booking_mode = $1 WHERE id = $2", [booking_mode, businessId]);
-    }
-
-    // Toggle de activación para recordatorio 5 min antes
-    if (notify_upcoming_appointments !== undefined) {
-      const val = notify_upcoming_appointments === true || notify_upcoming_appointments === 1 ? 1 : 0;
-      await pool.query("UPDATE business SET notify_upcoming_appointments = $1 WHERE id = $2", [val, businessId]);
-    }
-
-    const updatedRes = await pool.query("SELECT * FROM business WHERE id = $1", [businessId]);
-    return updatedRes.rows[0];
   });
 
   // --------------------------------------------------------------------------
   // GET /appointments/business -> Consultar información del negocio y servicios
   // --------------------------------------------------------------------------
   app.get("/business", async () => {
-    const businessRes = await pool.query("SELECT * FROM business LIMIT 1");
-    const business = businessRes.rows[0];
+    const business = await getBusinessProfile();
     if (!business) return { error: "No hay negocio cargado todavía" };
 
-    const servicesRes = await pool.query("SELECT * FROM service WHERE business_id = $1", [business.id]);
-    return { business, services: servicesRes.rows };
+    const services = await listServices();
+    return { business, services };
   });
 
   // --------------------------------------------------------------------------
@@ -431,25 +168,26 @@ export async function appointmentRoutes(app: FastifyInstance) {
     const { token } = request.body as { token?: string };
     if (!token) return reply.status(400).send({ error: "token es obligatorio" });
 
-    const businessId = await getBusinessId();
-    if (!businessId) return reply.status(400).send({ error: "No hay negocio cargado" });
-
-    await pool.query("UPDATE business SET expo_push_token = $1 WHERE id = $2", [token, businessId]);
-    return { status: "ok", token };
+    try {
+      await setBusinessPushToken(token);
+      return { status: "ok", token };
+    } catch (err: any) {
+      return reply.status(400).send({ error: err.message });
+    }
   });
 
   // --------------------------------------------------------------------------
   // POST /appointments/business/test-push -> Enviar alerta de prueba directa al barbero
   // --------------------------------------------------------------------------
   app.post("/business/test-push", async (request, reply) => {
-    const businessId = await getBusinessId();
-    if (!businessId) return reply.status(400).send({ error: "No hay negocio cargado" });
-
-    const businessRes = await pool.query("SELECT expo_push_token FROM business WHERE id = $1", [businessId]);
-    const token = businessRes.rows[0]?.expo_push_token;
+    const business = await getBusinessProfile();
+    const token = business?.expo_push_token;
 
     if (!token) {
-      return reply.status(400).send({ error: "No hay ningún teléfono vinculado todavía. Presiona 'Vincular Teléfono' primero." });
+      return reply.status(400).send({
+        error:
+          "No hay ningún teléfono vinculado todavía. Presiona 'Vincular Teléfono' primero.",
+      });
     }
 
     try {
@@ -461,7 +199,9 @@ export async function appointmentRoutes(app: FastifyInstance) {
       );
       return { success: true, message: "Notificación enviada", result };
     } catch (err: any) {
-      return reply.status(500).send({ error: err?.message || "Error enviando notificación push" });
+      return reply.status(500).send({
+        error: err?.message || "Error enviando notificación push",
+      });
     }
   });
 }
